@@ -131,7 +131,7 @@
 ;;
 ;; When context is available, gptel will include it with each LLM query.
 ;;
-;; Rewrite/refactor interface
+;; Rewrite interface
 ;;
 ;; In any buffer: with a region selected, you can rewrite prose, refactor code
 ;; or fill in the region.  This is accessible via `gptel-rewrite', and also from
@@ -1358,12 +1358,7 @@ If a region is selected, modifies the region.  Otherwise, modifies at the point.
                (system gptel--system-message))
   "Request a response from the `gptel-backend' for PROMPT.
 
-The request is asynchronous, the function immediately returns
-with the data that was sent.
-
-Note: This function is not fully self-contained.  Consider
-let-binding the parameters `gptel-backend', `gptel-model' and
-`gptel-use-context' around calls to it as required.
+The request is asynchronous, the function returns immediately.
 
 If PROMPT is
 - a string, it is used to create a full prompt suitable for
@@ -1373,7 +1368,6 @@ If PROMPT is
 - nil but region is active, the region contents are used.
 - nil, the current buffer's contents up to (point) are used.
   Previous responses from the LLM are identified as responses.
-- A list of plists, it is used as is.
 
 Keyword arguments:
 
@@ -1466,7 +1460,14 @@ streaming callbacks is slightly different:
 If DRY-RUN is non-nil, construct and return the full
 query data as usual, but do not send the request.
 
-Model parameters can be let-bound around calls to this function."
+Note:
+
+1. This function is not fully self-contained.  Consider
+let-binding the parameters `gptel-backend', `gptel-model' and
+`gptel-use-context' around calls to it as required.
+
+2. The return value of this function is a list of data that may
+be used to rerun or continue the request at a later time."
   (declare (indent 1))
   ;; TODO Remove this check in version 1.0
   (gptel--sanitize-model)
@@ -1503,8 +1504,7 @@ Model parameters can be let-bound around calls to this function."
                  (insert prompt)
                  (gptel--create-prompt))))
             ((consp prompt) (gptel--parse-list gptel-backend prompt)))))
-         (request-data (gptel--request-data gptel-backend full-prompt))
-         (info (list :data request-data
+         (info (list :data (gptel--request-data gptel-backend full-prompt)
                      :buffer buffer
                      :position start-marker)))
     ;; This context should not be confused with the context aggregation context!
@@ -1514,7 +1514,7 @@ Model parameters can be let-bound around calls to this function."
       (funcall (if gptel-use-curl
                    #'gptel-curl-get-response #'gptel--url-get-response)
                info callback))
-    request-data))
+    (list stream info callback)))
 
 (defvar gptel--request-alist nil "Alist of active gptel requests.")
 
@@ -1531,7 +1531,9 @@ BUF defaults to the current buffer."
               (info (cdr proc-attrs)))
     ;; Run callback with abort signal
     (with-demoted-errors "Callback error: %S"
-      (funcall (plist-get info :callback) 'abort info))
+      (and-let* ((cb (plist-get info :callback))
+                 ((functionp cb)))
+           (funcall cb 'abort info)))
     (if gptel-use-curl
         (progn                        ;Clean up Curl process
           (setf (alist-get proc gptel--request-alist nil 'remove) nil)
@@ -1570,27 +1572,75 @@ waiting for the response."
   (gptel--update-status " Waiting..." 'warning)))
 
 (declare-function json-pretty-print-buffer "json")
-(defun gptel--inspect-query (request-data &optional arg)
-  "Show REQUEST-DATA, the full LLM query to be sent, in a buffer.
+(defun gptel--inspect-query (request-args &optional format)
+  "Show REQUEST-ARGS, the full LLM query to be sent, in a buffer.
 
-This functions as a dry run of `gptel-send'.  If ARG is
+This functions as a dry run of `gptel-send'.  If FORMAT is
 the symbol json, show the encoded JSON query instead of the Lisp
-structure gptel uses."
+structure gptel uses.
+
+The request data may be edited and the query continued from this
+buffer."
   (with-current-buffer (get-buffer-create "*gptel-query*")
-    (let ((standard-output (current-buffer))
-          (inhibit-read-only t))
+    (let* ((standard-output (current-buffer))
+           (inhibit-read-only t)
+           (request-info (cadr request-args))
+           (request-data (plist-get request-info :data)))
       (buffer-disable-undo)
       (erase-buffer)
-      (if (eq arg 'json)
+      (if (eq format 'json)
           (progn (fundamental-mode)
                  (insert (gptel--json-encode request-data))
                  (json-pretty-print-buffer))
         (lisp-data-mode)
         (prin1 request-data)
         (pp-buffer))
+      (plist-put request-info :data nil)
+      ;; HACK: Reuse `gptel--bounds' to store request args.
+      ;; Not ideal, but less fragile than an overlay.
+      (setq-local gptel-stream  (car request-args)
+                  gptel--bounds (cdr request-args))
       (goto-char (point-min))
       (view-mode 1)
+      (setq buffer-undo-list nil)
+      (use-local-map
+       (make-composed-keymap
+        (define-keymap
+          "C-c C-c" #'gptel--continue-query
+          "C-c C-k" #'quit-window)
+        (current-local-map)))
+      (unless header-line-format
+        (setq header-line-format
+              (substitute-command-keys
+               (concat
+                "Edit request: \\[read-only-mode],"
+                " Send request: \\[gptel--continue-query],"
+                " Quit: \\[quit-window]"))))
       (display-buffer (current-buffer) gptel-display-buffer-action))))
+
+(defun gptel--continue-query ()
+  "Continue sending the gptel query displayed in this buffer.
+
+The request is continued with the same parameters as originally
+specified."
+  (interactive nil lisp-data-mode fundamental-mode)
+  (unless (equal (buffer-name) "*gptel-query*")
+    (user-error "This command is meant for use in a gptel dry-run buffer."))
+  (save-excursion
+    (goto-char (point-min))
+    (condition-case-unless-debug nil
+        (when-let* ((data (if (eq major-mode 'lisp-data-mode)
+                              (read (current-buffer))
+                            (gptel--json-read)))
+                    (info (car-safe gptel--bounds)))
+          (plist-put info :data data)
+          (apply (if gptel-use-curl
+                     #'gptel-curl-get-response
+                   #'gptel--url-get-response)
+                 gptel--bounds)
+          (quit-window))
+      (error
+       (user-error "Could not read request data from buffer!")))))
 
 (defun gptel--insert-response (response info)
   "Insert the LLM RESPONSE into the gptel buffer.
@@ -1863,7 +1913,7 @@ the response is inserted into the current buffer after point."
                               (funcall backend-url) backend-url))
                         (lambda (_)
                           (pcase-let ((`(,response ,http-msg ,error)
-                                       (gptel--url-parse-response backend (current-buffer)))
+                                       (gptel--url-parse-response backend info))
                                       (buf (current-buffer)))
                             (plist-put info :status http-msg)
                             (when error (plist-put info :error error))
@@ -1889,52 +1939,49 @@ See `gptel-curl--get-response' for its contents.")
 
 (defvar url-http-end-of-headers)
 (defvar url-http-response-status)
-(defun gptel--url-parse-response (backend response-buffer)
+(defun gptel--url-parse-response (backend proc-info)
   "Parse response from BACKEND in RESPONSE-BUFFER."
-  (when (buffer-live-p response-buffer)
-    (with-current-buffer response-buffer
-      (when gptel-log-level             ;logging
-        (save-excursion
-          (goto-char url-http-end-of-headers)
-          (when (eq gptel-log-level 'debug)
-            (gptel--log (gptel--json-encode (buffer-substring-no-properties (point-min) (point)))
-                        "response headers"))
-          (gptel--log (buffer-substring-no-properties (point) (point-max))
-                      "response body")))
-      (if-let* ((http-msg (string-trim (buffer-substring (line-beginning-position)
-                                                         (line-end-position))))
-                (response (progn (goto-char url-http-end-of-headers)
-                                 (condition-case nil
-                                     (gptel--json-read)
-                                   (error 'json-read-error)))))
-          (cond
-            ;; FIXME Handle the case where HTTP 100 is followed by HTTP (not 200) BUG #194
-           ((or (memq url-http-response-status '(200 100))
-                (string-match-p "\\(?:1\\|2\\)00 OK" http-msg))
-            (list (string-trim (gptel--parse-response backend response
-                                             `(:buffer ,response-buffer
-                                               :backend ,backend)))
-                   http-msg))
-           ((plist-get response :error)
-            (let* ((error-data (plist-get response :error))
-                   (error-msg (plist-get error-data :message))
-                   (error-type (plist-get error-data :type))
-                   (backend-name (gptel-backend-name backend)))
-              (if (stringp error-data)
-                  (progn
-		    (message "%s error: (%s) %s" backend-name http-msg error-data)
-                    (setq error-msg (string-trim error-data)))
-                (when (stringp error-msg)
-                  (message "%s error: (%s) %s" backend-name http-msg (string-trim error-msg)))
-                (when error-type
-		  (setq http-msg (concat "("  http-msg ") " (string-trim error-type)))))
-              (list nil (concat "(" http-msg ") " (or error-msg "")))))
-           ((eq response 'json-read-error)
-            (list nil (concat "(" http-msg ") Malformed JSON in response.") "json-read-error"))
-           (t (list nil (concat "(" http-msg ") Could not parse HTTP response.")
-                    "Could not parse HTTP response.")))
-        (list nil (concat "(" http-msg ") Could not parse HTTP response.")
-              "Could not parse HTTP response.")))))
+  (when gptel-log-level             ;logging
+    (save-excursion
+      (goto-char url-http-end-of-headers)
+      (when (eq gptel-log-level 'debug)
+        (gptel--log (gptel--json-encode (buffer-substring-no-properties (point-min) (point)))
+                    "response headers"))
+      (gptel--log (buffer-substring-no-properties (point) (point-max))
+                  "response body")))
+  (if-let* ((http-msg (string-trim (buffer-substring (line-beginning-position)
+                                                     (line-end-position))))
+            (response (progn (goto-char url-http-end-of-headers)
+                             (condition-case nil
+                                 (gptel--json-read)
+                               (error 'json-read-error)))))
+      (cond
+       ;; FIXME Handle the case where HTTP 100 is followed by HTTP (not 200) BUG #194
+       ((or (memq url-http-response-status '(200 100))
+            (string-match-p "\\(?:1\\|2\\)00 OK" http-msg))
+        (list (string-trim (gptel--parse-response backend response
+                                                  proc-info))
+              http-msg))
+       ((plist-get response :error)
+        (let* ((error-data (plist-get response :error))
+               (error-msg (plist-get error-data :message))
+               (error-type (plist-get error-data :type))
+               (backend-name (gptel-backend-name backend)))
+          (if (stringp error-data)
+              (progn
+		(message "%s error: (%s) %s" backend-name http-msg error-data)
+                (setq error-msg (string-trim error-data)))
+            (when (stringp error-msg)
+              (message "%s error: (%s) %s" backend-name http-msg (string-trim error-msg)))
+            (when error-type
+	      (setq http-msg (concat "("  http-msg ") " (string-trim error-type)))))
+          (list nil (concat "(" http-msg ") " (or error-msg "")))))
+       ((eq response 'json-read-error)
+        (list nil (concat "(" http-msg ") Malformed JSON in response.") "json-read-error"))
+       (t (list nil (concat "(" http-msg ") Could not parse HTTP response.")
+                "Could not parse HTTP response.")))
+    (list nil (concat "(" http-msg ") Could not parse HTTP response.")
+          "Could not parse HTTP response.")))
 
 (cl-defun gptel--sanitize-model (&key (backend gptel-backend)
                                       (model gptel-model)
